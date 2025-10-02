@@ -11,14 +11,14 @@ import (
 
 // signalReader wraps io.Reader and signals on first read
 type signalReader struct {
-	reader  io.Reader
-	once    sync.Once
-	started chan struct{}
+	reader    io.Reader
+	once      sync.Once
+	startedCh chan struct{}
 }
 
 func (r *signalReader) Read(p []byte) (n int, err error) {
 	r.once.Do(func() {
-		close(r.started)
+		close(r.startedCh)
 	})
 	return r.reader.Read(p)
 }
@@ -38,13 +38,13 @@ type request struct {
 }
 
 type Multipart struct {
-	client  *http.Client
-	req     *http.Request
-	wg      sync.WaitGroup
-	mw      *multipart.Writer
-	pw      *io.PipeWriter
-	body    chan request
-	started chan struct{}
+	client    *http.Client
+	req       *http.Request
+	wg        sync.WaitGroup
+	mw        *multipart.Writer
+	pw        *io.PipeWriter
+	bodyCh    chan request
+	startedCh chan struct{}
 }
 
 func NewMultipart(ctx context.Context, client *http.Client, method, url string) *Multipart {
@@ -52,14 +52,14 @@ func NewMultipart(ctx context.Context, client *http.Client, method, url string) 
 	started := make(chan struct{})
 
 	m := &Multipart{
-		client:  client,
-		body:    make(chan request, 100),
-		pw:      pw,
-		mw:      multipart.NewWriter(pw),
-		started: started,
+		client:    client,
+		bodyCh:    make(chan request, 100),
+		pw:        pw,
+		mw:        multipart.NewWriter(pw),
+		startedCh: started,
 	}
 
-	reader := &signalReader{reader: pr, started: started}
+	reader := &signalReader{reader: pr, startedCh: started}
 	m.req, _ = http.NewRequestWithContext(ctx, method, url, reader)
 	m.req.Header.Set("Content-Type", m.mw.FormDataContentType())
 
@@ -71,7 +71,7 @@ func NewMultipart(ctx context.Context, client *http.Client, method, url string) 
 
 func (m *Multipart) worker() {
 	defer m.wg.Done()
-	for req := range m.body {
+	for req := range m.bodyCh {
 		var err error
 		switch req.reqType {
 		case stringType:
@@ -91,7 +91,7 @@ func (m *Multipart) worker() {
 }
 
 func (m *Multipart) Param(key, value string) *Multipart {
-	m.body <- request{reqType: stringType, key: key, value: value}
+	m.bodyCh <- request{reqType: stringType, key: key, value: value}
 	return m
 }
 
@@ -104,7 +104,7 @@ func (m *Multipart) Float(key string, value float64) *Multipart {
 }
 
 func (m *Multipart) File(key, filename string, content io.Reader) *Multipart {
-	m.body <- request{reqType: fileType, key: key, value: filename, content: content}
+	m.bodyCh <- request{reqType: fileType, key: key, value: filename, content: content}
 	return m
 }
 
@@ -126,9 +126,9 @@ func (m *Multipart) Send() (*http.Response, error) {
 		respCh <- resp
 	}()
 
-	<-m.started
+	<-m.startedCh
 
-	close(m.body)
+	close(m.bodyCh)
 	m.wg.Wait()
 	m.mw.Close()
 	m.pw.Close()
