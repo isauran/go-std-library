@@ -11,15 +11,15 @@ import (
 	"time"
 )
 
-type ContentType int
+type BodyType int
 
 const (
-	ContentTypeString ContentType = iota
-	ContentTypeFile
+	String BodyType = iota
+	File
 )
 
 type RequestBody struct {
-	Type    ContentType
+	Type    BodyType
 	Key     string
 	Value   string
 	Content io.Reader
@@ -28,7 +28,7 @@ type RequestBody struct {
 type Request struct {
 	client  *http.Client
 	request *http.Request
-	body  chan RequestBody
+	body    chan RequestBody
 	wg      sync.WaitGroup
 	mw      *multipart.Writer
 	pr      *io.PipeReader
@@ -42,7 +42,7 @@ func NewRequest(client *http.Client, url string) *Request {
 	ch := make(chan RequestBody) // Unbuffered channel to preserve the order of operations.
 	r := &Request{
 		client: client,
-		body: ch,
+		body:   ch,
 		pr:     pipeReader,
 		pw:     pipeWriter,
 		mw:     multipart.NewWriter(pipeWriter),
@@ -76,20 +76,20 @@ func NewRequest(client *http.Client, url string) *Request {
 
 func (r *Request) worker() {
 	defer r.wg.Done()
-	for data := range r.body {
-		if data.Type == ContentTypeString {
-			err := r.mw.WriteField("string", data.Value)
+	for b := range r.body {
+		if b.Type == String {
+			err := r.mw.WriteField("string", b.Value)
 			if err != nil {
 				fmt.Println("Error writing field:", err)
 				continue
 			}
-		} else if data.Type == ContentTypeFile {
-			part, err := r.mw.CreateFormFile(data.Key, data.Value)
+		} else if b.Type == File {
+			part, err := r.mw.CreateFormFile(b.Key, b.Value)
 			if err != nil {
 				r.pw.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
 				return
 			}
-			if _, err := io.Copy(part, data.Content); err != nil {
+			if _, err := io.Copy(part, b.Content); err != nil {
 				r.pw.CloseWithError(fmt.Errorf("failed to copy file content: %w", err))
 				return
 			}
@@ -98,12 +98,12 @@ func (r *Request) worker() {
 }
 
 func (r *Request) String(line string) *Request {
-	r.body <- RequestBody{Type: ContentTypeString, Value: line}
+	r.body <- RequestBody{Type: String, Value: line}
 	return r
 }
 
-func (r *Request) File(content io.Reader) *Request {
-	r.body <- RequestBody{Type: ContentTypeFile, Content: content}
+func (r *Request) File(content io.Reader, key, filename string) *Request {
+	r.body <- RequestBody{Type: File, Content: content, Key: key, Value: filename}
 	return r
 }
 
@@ -155,7 +155,7 @@ func main() {
 		String("1").
 		String("2").
 		String("3").
-		File(html).
+		File(html, "file", "hello.html").
 		Send()
 
 	if err != nil {
