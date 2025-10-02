@@ -12,8 +12,8 @@ import (
 )
 
 type Data struct {
-	FileType string
-	Value    any
+	Type  string
+	Value any
 }
 
 type Request struct {
@@ -68,7 +68,7 @@ func NewRequest(client *http.Client, url string) *Request {
 func (r *Request) worker() {
 	defer r.wg.Done()
 	for data := range r.ch {
-		if data.FileType == "string" {
+		if data.Type == "string" {
 			if str, ok := data.Value.(string); ok {
 				err := r.mw.WriteField("string", str)
 				if err != nil {
@@ -76,7 +76,7 @@ func (r *Request) worker() {
 					continue
 				}
 			}
-		} else if data.FileType == "json" {
+		} else if data.Type == "json" {
 			part, err := r.mw.CreateFormFile("json", "data.json")
 			if err != nil {
 				fmt.Println("Error creating form file:", err)
@@ -97,12 +97,12 @@ func (r *Request) worker() {
 }
 
 func (r *Request) String(line string) *Request {
-	r.ch <- Data{FileType: "string", Value: line}
+	r.ch <- Data{Type: "string", Value: line}
 	return r
 }
 
 func (r *Request) JSON(j any) *Request {
-	r.ch <- Data{FileType: "json", Value: j}
+	r.ch <- Data{Type: "json", Value: j}
 	return r
 }
 
