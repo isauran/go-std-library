@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -10,152 +9,134 @@ import (
 	"sync"
 )
 
-type Reader struct {
-	reader       io.Reader
-	once         sync.Once
-	startRequest chan struct{}
+// signalReader wraps io.Reader and signals on first read
+type signalReader struct {
+	reader  io.Reader
+	once    sync.Once
+	started chan struct{}
 }
 
-func (s *Reader) Read(p []byte) (n int, err error) {
-	s.once.Do(func() {
-		close(s.startRequest)
+func (r *signalReader) Read(p []byte) (n int, err error) {
+	r.once.Do(func() {
+		close(r.started)
 	})
-	return s.reader.Read(p)
+	return r.reader.Read(p)
 }
 
-type RequestType int
+type requestType int
 
 const (
-	NoneType RequestType = iota
-	StringType
-	FileType
-	JSONType
+	stringType requestType = iota
+	fileType
 )
 
-type TRequest struct {
-	Type    RequestType
-	Key     string
-	Value   string
-	Content io.Reader
+type request struct {
+	reqType requestType
+	key     string
+	value   string
+	content io.Reader
 }
 
 type Multipart struct {
-	client       *http.Client
-	request      *http.Request
-	wg           sync.WaitGroup
-	mw           *multipart.Writer
-	pr           *io.PipeReader
-	pw           *io.PipeWriter
-	body         chan TRequest
-	resp         chan *http.Response
-	err          chan error
-	startRequest chan struct{}
+	client  *http.Client
+	req     *http.Request
+	wg      sync.WaitGroup
+	mw      *multipart.Writer
+	pw      *io.PipeWriter
+	body    chan request
+	started chan struct{}
 }
 
 func NewMultipart(ctx context.Context, client *http.Client, method, url string) *Multipart {
-	pipeReader, pipeWriter := io.Pipe()
-	ch := make(chan TRequest, 100)
-	r := &Multipart{
-		client:       client,
-		body:         ch,
-		pr:           pipeReader,
-		pw:           pipeWriter,
-		mw:           multipart.NewWriter(pipeWriter),
-		resp:         make(chan *http.Response, 1),
-		err:          make(chan error, 1),
-		startRequest: make(chan struct{}),
+	pr, pw := io.Pipe()
+	started := make(chan struct{})
+
+	m := &Multipart{
+		client:  client,
+		body:    make(chan request, 100),
+		pw:      pw,
+		mw:      multipart.NewWriter(pw),
+		started: started,
 	}
 
-	r.request, _ = http.NewRequestWithContext(ctx, method, url, &Reader{reader: pipeReader, startRequest: r.startRequest})
-	r.request.Header.Set("Content-Type", r.mw.FormDataContentType())
+	reader := &signalReader{reader: pr, started: started}
+	m.req, _ = http.NewRequestWithContext(ctx, method, url, reader)
+	m.req.Header.Set("Content-Type", m.mw.FormDataContentType())
 
-	// Start worker that will write to pipe
-	r.wg.Add(1)
-	go r.worker()
+	m.wg.Add(1)
+	go m.worker()
 
-	return r
+	return m
 }
 
-func (r *Multipart) worker() {
-	defer r.wg.Done()
-	for b := range r.body {
-		switch b.Type {
-		case StringType:
-			{
-				err := r.mw.WriteField(b.Key, b.Value)
-				if err != nil {
-					r.pw.CloseWithError(fmt.Errorf("failed to write form field [%q] value %s: %w", b.Key, b.Value, err))
-					return
-				}
-			}
-		case FileType:
-			{
-				part, err := r.mw.CreateFormFile(b.Key, b.Value)
-				if err != nil {
-					r.pw.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
-					return
-				}
-				if _, err := io.Copy(part, b.Content); err != nil {
-					r.pw.CloseWithError(fmt.Errorf("failed to copy file content: %w", err))
-					return
-				}
+func (m *Multipart) worker() {
+	defer m.wg.Done()
+	for req := range m.body {
+		var err error
+		switch req.reqType {
+		case stringType:
+			err = m.mw.WriteField(req.key, req.value)
+		case fileType:
+			var part io.Writer
+			part, err = m.mw.CreateFormFile(req.key, req.value)
+			if err == nil {
+				_, err = io.Copy(part, req.content)
 			}
 		}
-	}
-}
-
-func (r *Multipart) Param(key, value string) *Multipart {
-	r.body <- TRequest{Type: StringType, Key: key, Value: value}
-	return r
-}
-
-func (r *Multipart) Bool(fieldName string, value bool) *Multipart {
-	return r.Param(fieldName, strconv.FormatBool(value))
-}
-
-func (r *Multipart) Float(fieldName string, value float64) *Multipart {
-	return r.Param(fieldName, strconv.FormatFloat(value, 'f', -1, 64))
-}
-
-func (r *Multipart) File(key, filename string, content io.Reader) *Multipart {
-	r.body <- TRequest{Type: FileType, Key: key, Value: filename, Content: content}
-	return r
-}
-
-func (r *Multipart) Header(key, value string) *Multipart {
-	r.request.Header.Set(key, value)
-	return r
-}
-
-func (r *Multipart) close() {
-	close(r.body)
-	r.wg.Wait()
-	r.mw.Close()
-	r.pw.Close()
-}
-
-func (r *Multipart) Send() (*http.Response, error) {
-	// Start HTTP request with all headers set
-	go func() {
-		resp, err := r.client.Do(r.request)
 		if err != nil {
-			r.err <- err
+			m.pw.CloseWithError(err)
 			return
 		}
-		r.resp <- resp
+	}
+}
+
+func (m *Multipart) Param(key, value string) *Multipart {
+	m.body <- request{reqType: stringType, key: key, value: value}
+	return m
+}
+
+func (m *Multipart) Bool(key string, value bool) *Multipart {
+	return m.Param(key, strconv.FormatBool(value))
+}
+
+func (m *Multipart) Float(key string, value float64) *Multipart {
+	return m.Param(key, strconv.FormatFloat(value, 'f', -1, 64))
+}
+
+func (m *Multipart) File(key, filename string, content io.Reader) *Multipart {
+	m.body <- request{reqType: fileType, key: key, value: filename, content: content}
+	return m
+}
+
+func (m *Multipart) Header(key, value string) *Multipart {
+	m.req.Header.Set(key, value)
+	return m
+}
+
+func (m *Multipart) Send() (*http.Response, error) {
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		resp, err := m.client.Do(m.req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
 	}()
 
-	// Wait for HTTP client to start reading from pipe
-	<-r.startRequest
+	<-m.started
 
-	// Close to signal worker to finish and wait
-	r.close()
+	close(m.body)
+	m.wg.Wait()
+	m.mw.Close()
+	m.pw.Close()
 
-	// Wait for HTTP response
 	select {
-	case resp := <-r.resp:
+	case resp := <-respCh:
 		return resp, nil
-	case err := <-r.err:
+	case err := <-errCh:
 		return nil, err
 	}
 }
