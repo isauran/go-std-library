@@ -16,7 +16,7 @@ type Data struct {
 	Value    any
 }
 
-type Builder struct {
+type Request struct {
 	client  *http.Client
 	request *http.Request
 	ch      chan Data
@@ -28,10 +28,10 @@ type Builder struct {
 	errCh   chan error
 }
 
-func NewBuilder(client *http.Client, url string) *Builder {
+func NewRequest(client *http.Client, url string) *Request {
 	pipeReader, pipeWriter := io.Pipe()
 	ch := make(chan Data) // Unbuffered channel to preserve the order of operations.
-	r := &Builder{
+	r := &Request{
 		client: client,
 		ch:     ch,
 		pr:     pipeReader,
@@ -51,7 +51,7 @@ func NewBuilder(client *http.Client, url string) *Builder {
 
 	// Start HTTP request in background immediately
 	go func() {
-		resp, err := r.doRequest()
+		resp, err := r.client.Do(r.request)
 		if err != nil {
 			r.errCh <- err
 			return
@@ -65,7 +65,7 @@ func NewBuilder(client *http.Client, url string) *Builder {
 	return r
 }
 
-func (r *Builder) worker() {
+func (r *Request) worker() {
 	defer r.wg.Done()
 	for data := range r.ch {
 		if data.FileType == "string" {
@@ -96,32 +96,24 @@ func (r *Builder) worker() {
 	}
 }
 
-func (r *Builder) String(line string) *Builder {
+func (r *Request) String(line string) *Request {
 	r.ch <- Data{FileType: "string", Value: line}
 	return r
 }
 
-func (r *Builder) JSON(j any) *Builder {
+func (r *Request) JSON(j any) *Request {
 	r.ch <- Data{FileType: "json", Value: j}
 	return r
 }
 
-func (r *Builder) doRequest() (*http.Response, error) {
-	resp, err := r.client.Do(r.request)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (r *Builder) Close() {
+func (r *Request) Close() {
 	close(r.ch)
 	r.wg.Wait()
 	r.mw.Close()
 	r.pw.Close()
 }
 
-func (r *Builder) Send() (*http.Response, error) {
+func (r *Request) Send() (*http.Response, error) {
 	// Close to signal worker to finish and wait
 	r.Close()
 
@@ -149,7 +141,7 @@ func main() {
 
 	client := http.DefaultClient
 
-	resp, err := NewBuilder(client, "http://localhost:8080/upload").
+	resp, err := NewRequest(client, "http://localhost:8080/upload").
 		String("1").
 		String("2").
 		String("3").
