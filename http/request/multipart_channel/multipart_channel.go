@@ -6,52 +6,54 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
 
-type BodyType int
+type RequestType int
 
 const (
-	String BodyType = iota
-	File
+	NoneType RequestType = iota
+	StringType
+	FileType
+	JSONType
 )
 
-type RequestBody struct {
-	Type    BodyType
+type TRequest struct {
+	Type    RequestType
 	Key     string
 	Value   string
 	Content io.Reader
 }
 
-type Request struct {
+type Multipart struct {
 	client  *http.Client
 	request *http.Request
-	body    chan RequestBody
 	wg      sync.WaitGroup
 	mw      *multipart.Writer
 	pr      *io.PipeReader
 	pw      *io.PipeWriter
-	respCh  chan *http.Response
-	errCh   chan error
+	body    chan TRequest
+	resp    chan *http.Response
+	err     chan error
 }
 
-func NewRequest(client *http.Client, url string) *Request {
+func NewMultipart(ctx context.Context, client *http.Client, method, url string) *Multipart {
 	pipeReader, pipeWriter := io.Pipe()
-	ch := make(chan RequestBody) // Unbuffered channel to preserve the order of operations.
-	r := &Request{
+	ch := make(chan TRequest) // Unbuffered channel to preserve the order of operations.
+	r := &Multipart{
 		client: client,
 		body:   ch,
 		pr:     pipeReader,
 		pw:     pipeWriter,
 		mw:     multipart.NewWriter(pipeWriter),
-		respCh: make(chan *http.Response, 1),
-		errCh:  make(chan error, 1),
+		resp:   make(chan *http.Response, 1),
+		err:    make(chan error, 1),
 	}
 
 	// Create HTTP request with pipe reader
-	r.request, _ = http.NewRequest("POST", url, pipeReader)
+	r.request, _ = http.NewRequestWithContext(ctx, method, url, pipeReader)
 	r.request.Header.Set("Content-Type", r.mw.FormDataContentType())
 
 	// Start worker that will write to pipe
@@ -62,10 +64,10 @@ func NewRequest(client *http.Client, url string) *Request {
 	go func() {
 		resp, err := r.client.Do(r.request)
 		if err != nil {
-			r.errCh <- err
+			r.err <- err
 			return
 		}
-		r.respCh <- resp
+		r.resp <- resp
 	}()
 
 	// Give HTTP client time to start
@@ -74,162 +76,73 @@ func NewRequest(client *http.Client, url string) *Request {
 	return r
 }
 
-func (r *Request) worker() {
+func (r *Multipart) worker() {
 	defer r.wg.Done()
 	for b := range r.body {
-		if b.Type == String {
-			err := r.mw.WriteField("string", b.Value)
-			if err != nil {
-				fmt.Println("Error writing field:", err)
-				continue
+		switch b.Type {
+		case StringType:
+			{
+				err := r.mw.WriteField(b.Key, b.Value)
+				if err != nil {
+					r.pw.CloseWithError(fmt.Errorf("failed to write form field [%q] value %s: %w", b.Key, b.Value, err))
+					return
+				}
 			}
-		} else if b.Type == File {
-			part, err := r.mw.CreateFormFile(b.Key, b.Value)
-			if err != nil {
-				r.pw.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
-				return
-			}
-			if _, err := io.Copy(part, b.Content); err != nil {
-				r.pw.CloseWithError(fmt.Errorf("failed to copy file content: %w", err))
-				return
+		case FileType:
+			{
+				part, err := r.mw.CreateFormFile(b.Key, b.Value)
+				if err != nil {
+					r.pw.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
+					return
+				}
+				if _, err := io.Copy(part, b.Content); err != nil {
+					r.pw.CloseWithError(fmt.Errorf("failed to copy file content: %w", err))
+					return
+				}
 			}
 		}
 	}
 }
 
-func (r *Request) String(line string) *Request {
-	r.body <- RequestBody{Type: String, Value: line}
+func (r *Multipart) Param(key, value string) *Multipart {
+	r.body <- TRequest{Type: StringType, Key: key, Value: value}
 	return r
 }
 
-func (r *Request) File(content io.Reader, key, filename string) *Request {
-	r.body <- RequestBody{Type: File, Content: content, Key: key, Value: filename}
+func (r *Multipart) Bool(fieldName string, value bool) *Multipart {
+	return r.Param(fieldName, strconv.FormatBool(value))
+}
+
+func (r *Multipart) Float(fieldName string, value float64) *Multipart {
+	return r.Param(fieldName, strconv.FormatFloat(value, 'f', -1, 64))
+}
+
+func (r *Multipart) File(key, filename string, content io.Reader) *Multipart {
+	r.body <- TRequest{Type: FileType, Key: key, Value: filename, Content: content}
 	return r
 }
 
-func (r *Request) Header(key, value string) *Request {
+func (r *Multipart) Header(key, value string) *Multipart {
 	r.request.Header.Set(key, value)
 	return r
 }
 
-func (r *Request) Close() {
+func (r *Multipart) Close() {
 	close(r.body)
 	r.wg.Wait()
 	r.mw.Close()
 	r.pw.Close()
 }
 
-func (r *Request) Send() (*http.Response, error) {
+func (r *Multipart) Send() (*http.Response, error) {
 	// Close to signal worker to finish and wait
 	r.Close()
 
 	// Wait for HTTP response
 	select {
-	case resp := <-r.respCh:
+	case resp := <-r.resp:
 		return resp, nil
-	case err := <-r.errCh:
+	case err := <-r.err:
 		return nil, err
-	}
-}
-
-func main() {
-	server := &http.Server{Addr: ":8080"}
-	http.HandleFunc("/upload", uploadHandler)
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("Server error: %v\n", err)
-		}
-	}()
-
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
-
-	client := http.DefaultClient
-
-	html := strings.NewReader("<html><body><h1>Hello World!</h1></body></html>")
-
-	resp, err := NewRequest(client, "http://localhost:8080/upload").
-		Header("X-Custom-Header", "custom-value").
-		Header("Authorization", "Bearer token123").
-		String("1").
-		String("2").
-		String("3").
-		File(html, "file", "hello.html").
-		Send()
-
-	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
-	}
-
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return
-	}
-	fmt.Printf("Response: %s\n", body)
-
-	// Shutdown server
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		fmt.Printf("Server shutdown error: %v\n", err)
-	}
-}
-
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Log received headers
-	fmt.Println("=== Received Headers ===")
-	for key, values := range r.Header {
-		for _, value := range values {
-			fmt.Printf("Header: %s = %s\n", key, value)
-		}
-	}
-	fmt.Println("========================")
-
-	err := r.ParseMultipartForm(32 << 20) // 32 MB max
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	fmt.Fprintf(w, "Received multipart form:\n")
-	fmt.Fprintf(w, "\nHeaders:\n")
-	fmt.Fprintf(w, "  X-Custom-Header: %s\n", r.Header.Get("X-Custom-Header"))
-	fmt.Fprintf(w, "  Authorization: %s\n", r.Header.Get("Authorization"))
-	fmt.Fprintf(w, "\n")
-
-	// Handle form fields
-	for key, values := range r.MultipartForm.Value {
-		for _, value := range values {
-			fmt.Fprintf(w, "Field %s: %s\n", key, value)
-		}
-	}
-
-	// Handle files
-	for key, fileHeaders := range r.MultipartForm.File {
-		for _, fileHeader := range fileHeaders {
-			file, err := fileHeader.Open()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			defer file.Close()
-
-			content, err := io.ReadAll(file)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			fmt.Fprintf(w, "File %s (%s): %s\n", key, fileHeader.Filename, string(content))
-		}
 	}
 }
