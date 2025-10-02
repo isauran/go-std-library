@@ -8,8 +8,20 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	"time"
 )
+
+type Reader struct {
+	reader       io.Reader
+	once         sync.Once
+	startRequest chan struct{}
+}
+
+func (s *Reader) Read(p []byte) (n int, err error) {
+	s.once.Do(func() {
+		close(s.startRequest)
+	})
+	return s.reader.Read(p)
+}
 
 type RequestType int
 
@@ -28,50 +40,38 @@ type TRequest struct {
 }
 
 type Multipart struct {
-	client  *http.Client
-	request *http.Request
-	wg      sync.WaitGroup
-	mw      *multipart.Writer
-	pr      *io.PipeReader
-	pw      *io.PipeWriter
-	body    chan TRequest
-	resp    chan *http.Response
-	err     chan error
+	client       *http.Client
+	request      *http.Request
+	wg           sync.WaitGroup
+	mw           *multipart.Writer
+	pr           *io.PipeReader
+	pw           *io.PipeWriter
+	body         chan TRequest
+	resp         chan *http.Response
+	err          chan error
+	startRequest chan struct{}
 }
 
 func NewMultipart(ctx context.Context, client *http.Client, method, url string) *Multipart {
 	pipeReader, pipeWriter := io.Pipe()
-	ch := make(chan TRequest) // Unbuffered channel to preserve the order of operations.
+	ch := make(chan TRequest, 100)
 	r := &Multipart{
-		client: client,
-		body:   ch,
-		pr:     pipeReader,
-		pw:     pipeWriter,
-		mw:     multipart.NewWriter(pipeWriter),
-		resp:   make(chan *http.Response, 1),
-		err:    make(chan error, 1),
+		client:       client,
+		body:         ch,
+		pr:           pipeReader,
+		pw:           pipeWriter,
+		mw:           multipart.NewWriter(pipeWriter),
+		resp:         make(chan *http.Response, 1),
+		err:          make(chan error, 1),
+		startRequest: make(chan struct{}),
 	}
 
-	// Create HTTP request with pipe reader
-	r.request, _ = http.NewRequestWithContext(ctx, method, url, pipeReader)
+	r.request, _ = http.NewRequestWithContext(ctx, method, url, &Reader{reader: pipeReader, startRequest: r.startRequest})
 	r.request.Header.Set("Content-Type", r.mw.FormDataContentType())
 
 	// Start worker that will write to pipe
 	r.wg.Add(1)
 	go r.worker()
-
-	// Start HTTP request in background immediately
-	go func() {
-		resp, err := r.client.Do(r.request)
-		if err != nil {
-			r.err <- err
-			return
-		}
-		r.resp <- resp
-	}()
-
-	// Give HTTP client time to start
-	time.Sleep(50 * time.Millisecond)
 
 	return r
 }
@@ -127,7 +127,7 @@ func (r *Multipart) Header(key, value string) *Multipart {
 	return r
 }
 
-func (r *Multipart) Close() {
+func (r *Multipart) close() {
 	close(r.body)
 	r.wg.Wait()
 	r.mw.Close()
@@ -135,8 +135,21 @@ func (r *Multipart) Close() {
 }
 
 func (r *Multipart) Send() (*http.Response, error) {
+	// Start HTTP request with all headers set
+	go func() {
+		resp, err := r.client.Do(r.request)
+		if err != nil {
+			r.err <- err
+			return
+		}
+		r.resp <- resp
+	}()
+
+	// Wait for HTTP client to start reading from pipe
+	<-r.startRequest
+
 	// Close to signal worker to finish and wait
-	r.Close()
+	r.close()
 
 	// Wait for HTTP response
 	select {

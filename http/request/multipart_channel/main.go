@@ -29,6 +29,7 @@ func main() {
 	resp, err := NewMultipart(context.Background(), client, http.MethodPost, "http://localhost:8080/upload").
 		Header("X-Custom-Header", "custom-value").
 		Header("Authorization", "Bearer token123").
+		Header("Gotenberg-Webhook-Url", "http://host.docker.internal:28080/success").
 		Param("key1", "1").
 		Param("key2", "2").
 		Param("key3", "3").
@@ -82,8 +83,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "Received multipart form:\n")
 	fmt.Fprintf(w, "\nHeaders:\n")
-	fmt.Fprintf(w, "  X-Custom-Header: %s\n", r.Header.Get("X-Custom-Header"))
-	fmt.Fprintf(w, "  Authorization: %s\n", r.Header.Get("Authorization"))
+	fmt.Fprintf(w, "X-Custom-Header: %s\n", r.Header.Get("X-Custom-Header"))
+	fmt.Fprintf(w, "Authorization: %s\n", r.Header.Get("Authorization"))
+	fmt.Fprintf(w, "Gotenberg-Webhook-Url: %s\n", r.Header.Get("Gotenberg-Webhook-Url"))
 	fmt.Fprintf(w, "\n")
 
 	// Handle form fields
