@@ -31,10 +31,9 @@ const (
 )
 
 type request struct {
-	reqType requestType
-	key     string
-	value   string
-	content io.Reader
+	reqType    requestType
+	key, value string
+	content    io.Reader
 }
 
 type Multipart struct {
@@ -101,6 +100,10 @@ func (m *Multipart) Bool(key string, value bool) *Multipart {
 
 func (m *Multipart) Float(key string, value float64) *Multipart {
 	return m.Param(key, strconv.FormatFloat(value, 'f', -1, 64))
+}
+
+func (m *Multipart) Int(key string, value int) *Multipart {
+	return m.Param(key, strconv.Itoa(value))
 }
 
 func (m *Multipart) File(key, filename string, content io.Reader) *Multipart {
