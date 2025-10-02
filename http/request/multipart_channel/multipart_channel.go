@@ -106,6 +106,11 @@ func (r *Request) JSON(j any) *Request {
 	return r
 }
 
+func (r *Request) Header(key, value string) *Request {
+	r.request.Header.Set(key, value)
+	return r
+}
+
 func (r *Request) Close() {
 	close(r.ch)
 	r.wg.Wait()
@@ -142,6 +147,8 @@ func main() {
 	client := http.DefaultClient
 
 	resp, err := NewRequest(client, "http://localhost:8080/upload").
+		Header("X-Custom-Header", "custom-value").
+		Header("Authorization", "Bearer token123").
 		String("1").
 		String("2").
 		String("3").
@@ -176,6 +183,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Log received headers
+	fmt.Println("=== Received Headers ===")
+	for key, values := range r.Header {
+		for _, value := range values {
+			fmt.Printf("Header: %s = %s\n", key, value)
+		}
+	}
+	fmt.Println("========================")
+
 	err := r.ParseMultipartForm(32 << 20) // 32 MB max
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -183,6 +199,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w, "Received multipart form:\n")
+	fmt.Fprintf(w, "\nHeaders:\n")
+	fmt.Fprintf(w, "  X-Custom-Header: %s\n", r.Header.Get("X-Custom-Header"))
+	fmt.Fprintf(w, "  Authorization: %s\n", r.Header.Get("Authorization"))
+	fmt.Fprintf(w, "\n")
 
 	// Handle form fields
 	for key, values := range r.MultipartForm.Value {
