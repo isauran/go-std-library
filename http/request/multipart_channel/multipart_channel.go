@@ -2,31 +2,33 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
-type DataType int
+type ContentType int
 
 const (
-	DataTypeString DataType = iota
-	DataTypeJSON
+	ContentTypeString ContentType = iota
+	ContentTypeFile
 )
 
-type Data struct {
-	Type  DataType
-	Value any
+type RequestBody struct {
+	Type    ContentType
+	Key     string
+	Value   string
+	Content io.Reader
 }
 
 type Request struct {
 	client  *http.Client
 	request *http.Request
-	ch      chan Data
+	body  chan RequestBody
 	wg      sync.WaitGroup
 	mw      *multipart.Writer
 	pr      *io.PipeReader
@@ -37,10 +39,10 @@ type Request struct {
 
 func NewRequest(client *http.Client, url string) *Request {
 	pipeReader, pipeWriter := io.Pipe()
-	ch := make(chan Data) // Unbuffered channel to preserve the order of operations.
+	ch := make(chan RequestBody) // Unbuffered channel to preserve the order of operations.
 	r := &Request{
 		client: client,
-		ch:     ch,
+		body: ch,
 		pr:     pipeReader,
 		pw:     pipeWriter,
 		mw:     multipart.NewWriter(pipeWriter),
@@ -74,42 +76,34 @@ func NewRequest(client *http.Client, url string) *Request {
 
 func (r *Request) worker() {
 	defer r.wg.Done()
-	for data := range r.ch {
-		if data.Type == DataTypeString {
-			if str, ok := data.Value.(string); ok {
-				err := r.mw.WriteField("string", str)
-				if err != nil {
-					fmt.Println("Error writing field:", err)
-					continue
-				}
-			}
-		} else if data.Type == DataTypeJSON {
-			part, err := r.mw.CreateFormFile("json", "data.json")
+	for data := range r.body {
+		if data.Type == ContentTypeString {
+			err := r.mw.WriteField("string", data.Value)
 			if err != nil {
-				fmt.Println("Error creating form file:", err)
+				fmt.Println("Error writing field:", err)
 				continue
 			}
-			jsonData, err := json.Marshal(data.Value)
+		} else if data.Type == ContentTypeFile {
+			part, err := r.mw.CreateFormFile(data.Key, data.Value)
 			if err != nil {
-				fmt.Println("Error marshaling JSON:", err)
-				continue
+				r.pw.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
+				return
 			}
-			_, err = part.Write(jsonData)
-			if err != nil {
-				fmt.Println("Error writing to part:", err)
-				continue
+			if _, err := io.Copy(part, data.Content); err != nil {
+				r.pw.CloseWithError(fmt.Errorf("failed to copy file content: %w", err))
+				return
 			}
 		}
 	}
 }
 
 func (r *Request) String(line string) *Request {
-	r.ch <- Data{Type: DataTypeString, Value: line}
+	r.body <- RequestBody{Type: ContentTypeString, Value: line}
 	return r
 }
 
-func (r *Request) JSON(j any) *Request {
-	r.ch <- Data{Type: DataTypeJSON, Value: j}
+func (r *Request) File(content io.Reader) *Request {
+	r.body <- RequestBody{Type: ContentTypeFile, Content: content}
 	return r
 }
 
@@ -119,7 +113,7 @@ func (r *Request) Header(key, value string) *Request {
 }
 
 func (r *Request) Close() {
-	close(r.ch)
+	close(r.body)
 	r.wg.Wait()
 	r.mw.Close()
 	r.pw.Close()
@@ -153,13 +147,15 @@ func main() {
 
 	client := http.DefaultClient
 
+	html := strings.NewReader("<html><body><h1>Hello World!</h1></body></html>")
+
 	resp, err := NewRequest(client, "http://localhost:8080/upload").
 		Header("X-Custom-Header", "custom-value").
 		Header("Authorization", "Bearer token123").
 		String("1").
 		String("2").
 		String("3").
-		JSON(map[string]string{"key": "value"}).
+		File(html).
 		Send()
 
 	if err != nil {
